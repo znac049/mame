@@ -45,6 +45,8 @@
 #include "machine/mc68681.h"
 #include "machine/ram.h"
 
+#include "multibyte.h"
+
 
 namespace {
 
@@ -244,6 +246,15 @@ QUICKLOAD_LOAD_MEMBER(sbc3_state::quickload_cb)
 void sbc3_state::machine_start()
 {
 	address_space &space = m_maincpu->space(AS_PROGRAM);
+
+	// No ROM image: give the CPU a stub that waits in a loop, so that
+	// -quik can start a program without a monitor ROM being present.
+	if (m_rom[0] == 0xffffffff && m_rom[1] == 0xffffffff)
+	{
+		m_rom[0] = 0x00002000;      // reset SSP
+		m_rom[1] = 0x00c00008;      // reset PC
+		m_rom[2] = 0x60fe4e71;      // bra.s * ; nop
+	}
 
 	// RAM from $0, at most 8 MB.
 	const u32 ramsize = std::min<u32>(m_ram->size(), 0x800000);
