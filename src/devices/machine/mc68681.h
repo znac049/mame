@@ -153,6 +153,9 @@ private:
 	TIMER_CALLBACK_MEMBER(duart_timer_callback);
 
 protected:
+	// scale a baud-table rate (given for a 3.6864 MHz crystal) to our clock
+	int brg_rate(int table_rate) const;
+
 	/* registers */
 	uint8_t ACR;  /* Auxiliary Control Register */
 	uint8_t IMR;  /* Interrupt Mask Register */
@@ -177,7 +180,6 @@ private:
 	uint16_t get_ct_count();
 	void start_ct(int count);
 	virtual int calc_baud(int ch, bool rx, uint8_t data);
-	int brg_rate(int table_rate) const;
 	void clear_ISR_bits(int mask);
 	void set_ISR_bits(int mask);
 
