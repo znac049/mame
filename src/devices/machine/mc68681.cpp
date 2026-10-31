@@ -1128,13 +1128,25 @@ duart_channel *duart_base_device::get_channel(int chan)
 	return m_chanB;
 }
 
+/*
+ * The baud rate tables give the rates for a 3.6864 MHz X1 clock; the
+ * internal baud rate generator divides X1, so scale them for other
+ * crystals (e.g. 7.3728 MHz doubles every rate).
+ */
+int duart_base_device::brg_rate(int table_rate) const
+{
+	if (table_rate == 0 || clock() == 0 || clock() == 3686400)
+		return table_rate;
+	return int((u64(table_rate) * clock() + 1843200) / 3686400);
+}
+
 int duart_base_device::calc_baud(int ch, bool rx, uint8_t data)
 {
 	int baud_rate;
 
 	if (BIT(ACR, 7) == 0)
 	{
-		baud_rate = baud_rate_ACR_0[data & 0x0f];
+		baud_rate = brg_rate(baud_rate_ACR_0[data & 0x0f]);
 
 		if (ch == 0)
 		{
@@ -1161,7 +1173,7 @@ int duart_base_device::calc_baud(int ch, bool rx, uint8_t data)
 	}
 	else
 	{
-		baud_rate = baud_rate_ACR_1[data & 0x0f];
+		baud_rate = brg_rate(baud_rate_ACR_1[data & 0x0f]);
 
 		if (ch == 0)
 		{
@@ -1269,7 +1281,7 @@ int xr68c681_device::calc_baud(int ch, bool rx, uint8_t data)
 	int baud_rate;
 
 
-	baud_rate = baud_rate_ACR_0[data & 0x0f];
+	baud_rate = brg_rate(baud_rate_ACR_0[data & 0x0f]);
 
 	if (ch == 0)
 	{
@@ -1278,9 +1290,9 @@ int xr68c681_device::calc_baud(int ch, bool rx, uint8_t data)
 		else if ((data & 0x0f) == 0x0f)
 			baud_rate = ip3clk;
 		else if ((rx && m_XRXA) || (!rx && m_XTXA)) /* X = 1 */
-			baud_rate = BIT(ACR, 7) == 0 ? baud_rate_ACR_0_X_1[data & 0x0f] : baud_rate_ACR_1_X_1[data & 0x0f];
+			baud_rate = brg_rate(BIT(ACR, 7) == 0 ? baud_rate_ACR_0_X_1[data & 0x0f] : baud_rate_ACR_1_X_1[data & 0x0f]);
 		else /* X = 0 */
-			baud_rate = BIT(ACR, 7) == 0 ? baud_rate_ACR_0[data & 0x0f] : baud_rate_ACR_1[data & 0x0f];
+			baud_rate = brg_rate(BIT(ACR, 7) == 0 ? baud_rate_ACR_0[data & 0x0f] : baud_rate_ACR_1[data & 0x0f]);
 	}
 	else if (ch == 1)
 	{
@@ -1289,9 +1301,9 @@ int xr68c681_device::calc_baud(int ch, bool rx, uint8_t data)
 		else if ((data & 0x0f) == 0x0f)
 			baud_rate = ip5clk;
 		else if ((rx && m_XRXB) || (!rx && m_XTXB)) /* X = 1 */
-			baud_rate = BIT(ACR, 7) == 0 ? baud_rate_ACR_0_X_1[data & 0x0f] : baud_rate_ACR_1_X_1[data & 0x0f];
+			baud_rate = brg_rate(BIT(ACR, 7) == 0 ? baud_rate_ACR_0_X_1[data & 0x0f] : baud_rate_ACR_1_X_1[data & 0x0f]);
 		else /* X = 0 */
-			baud_rate = BIT(ACR, 7) == 0 ? baud_rate_ACR_0[data & 0x0f] : baud_rate_ACR_1[data & 0x0f];
+			baud_rate = brg_rate(BIT(ACR, 7) == 0 ? baud_rate_ACR_0[data & 0x0f] : baud_rate_ACR_1[data & 0x0f]);
 	}
 
 	if ((baud_rate == 0) && ((data & 0xf) != 0xd))

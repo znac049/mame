@@ -21303,6 +21303,9 @@ sc116
 sc133
 sc203
 
+@source:homebrew/sbc3.cpp
+sbc3
+
 @source:homebrew/sbc6120.cpp
 sbc6120
 
