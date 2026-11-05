@@ -21,6 +21,12 @@
       DS1307 RTC on I2C, bit-banged on PI/T port C: PC0 = SDA, PC1 = SCL,
           open-drain (PCDR held at 0; a line is pulled low by setting its
           PCDDR bit)
+      Optional Mega-Micros Hex Display board at $AB0000 (configuration
+          switch): 8 hex digits and 32 binary LEDs.  Byte n ($AB0000+n)
+          drives digits 2n+1/2n+2 and binary row n+1; word and long
+          writes set 4 or 8 digits.  Only A0-A1 are decoded within the
+          64K page.  The board's documentation doesn't describe reads;
+          here they return $FF and don't bus-error.
 
     Interrupt acknowledge, as decoded by the board:
       level 1  PI/T timer vector (TIVR)
@@ -53,6 +59,8 @@
 
 #include "multibyte.h"
 
+#include "sbc3.lh"
+
 
 namespace {
 
@@ -70,6 +78,8 @@ public:
 		, m_rtc(*this, "rtc")
 		, m_config(*this, "CONFIG")
 		, m_links(*this, "LINKS")
+		, m_hex_digits(*this, "digit%u", 0U)
+		, m_hex_bits(*this, "bit%u", 0U)
 	{ }
 
 	void sbc3(machine_config &config) ATTR_COLD;
@@ -89,6 +99,9 @@ private:
 	u8 pit_pc_r();
 	u32 berr_r(offs_t offset, u32 mem_mask);
 	void berr_w(offs_t offset, u32 data, u32 mem_mask);
+	u32 hexdisp_r(offs_t offset, u32 mem_mask);
+	void hexdisp_w(offs_t offset, u32 data, u32 mem_mask);
+	void hexdisp_update();
 
 	DECLARE_QUICKLOAD_LOAD_MEMBER(quickload_cb);
 
@@ -101,6 +114,8 @@ private:
 	required_device<i2c_ds1307_device> m_rtc;
 	required_ioport m_config;
 	required_ioport m_links;
+	output_finder<8> m_hex_digits;
+	output_finder<32> m_hex_bits;
 
 	memory_passthrough_handler m_overlay_tap;
 	memory_passthrough_handler m_pcddr_tap;
@@ -108,6 +123,10 @@ private:
 	static constexpr u32 EXP_RAM_SIZE = 0x02000000;     // 32 MB
 	std::unique_ptr<u8[]> m_exp_ram;
 	bool m_exp_mapped = false;
+	static constexpr u32 HEXDISP_BASE = 0x00ab0000;
+	bool m_hexdisp_mapped = false;
+	u32 m_hexdisp = 0;          // latched value, digit 1 in bits 31-28
+	u8 m_hexdisp_valid = 0;     // which bytes have been written since power-on
 	u8 m_pcddr = 0;
 	int m_rtc_sda = 1;
 	int m_cf_irq = 0;
@@ -179,6 +198,45 @@ void sbc3_state::berr_w(offs_t offset, u32 data, u32 mem_mask)
 		m_maincpu->set_buserror_details(0x800000 + offset * 4, 0, m_maincpu->get_fc());
 		m_maincpu->pulse_input_line(M68K_LINE_BUSERROR, attotime::zero);
 	}
+}
+
+
+/***************************************************************************
+    Mega-Micros Hex Display board
+
+    Four 8-bit latches, one per byte lane, each driving two hex digits and
+    eight binary LEDs.  The latches power up holding garbage; here a digit
+    pair stays blank until it is first written.
+***************************************************************************/
+
+u32 sbc3_state::hexdisp_r(offs_t offset, u32 mem_mask)
+{
+	return 0xffffffff;
+}
+
+void sbc3_state::hexdisp_w(offs_t offset, u32 data, u32 mem_mask)
+{
+	COMBINE_DATA(&m_hexdisp);
+	for (int n = 0; n < 4; n++)
+		if (BIT(mem_mask, 31 - 8 * n))
+			m_hexdisp_valid |= 1 << n;
+	hexdisp_update();
+}
+
+void sbc3_state::hexdisp_update()
+{
+	// 7-segment patterns for 0-F (TIL311-style: A b C d E F)
+	static constexpr u8 SEGS[16] = {
+		0x3f, 0x06, 0x5b, 0x4f, 0x66, 0x6d, 0x7d, 0x07,
+		0x7f, 0x6f, 0x77, 0x7c, 0x39, 0x5e, 0x79, 0x71 };
+
+	for (int d = 0; d < 8; d++)
+	{
+		const bool valid = BIT(m_hexdisp_valid, d / 2);
+		m_hex_digits[d] = valid ? SEGS[(m_hexdisp >> (28 - 4 * d)) & 0xf] : 0;
+	}
+	for (int b = 0; b < 32; b++)
+		m_hex_bits[b] = BIT(m_hexdisp_valid, 3 - b / 8) ? BIT(m_hexdisp, b) : 0;
 }
 
 
@@ -355,6 +413,8 @@ void sbc3_state::machine_start()
 			&m_pcddr_tap);
 
 	save_item(NAME(m_cf_irq));
+	save_item(NAME(m_hexdisp));
+	save_item(NAME(m_hexdisp_valid));
 	save_item(NAME(m_pcddr));
 	save_item(NAME(m_rtc_sda));
 }
@@ -378,6 +438,18 @@ void sbc3_state::machine_reset()
 		space.install_ram(EXP_RAM_BASE, EXP_RAM_BASE + EXP_RAM_SIZE - 1, m_exp_ram.get());
 		m_exp_mapped = true;
 	}
+
+	// Hex Display board: decodes A16-A23 and A0-A1 only, so its four
+	// bytes repeat through the 64K page (and every 16 MB, like the rest
+	// of the board).  Not fitted: the page keeps its bus error.
+	if (BIT(m_config->read(), 2) && !m_hexdisp_mapped)
+	{
+		space.install_readwrite_handler(HEXDISP_BASE, HEXDISP_BASE + 3, 0, 0xff00fffc, 0,
+				read32s_delegate(*this, FUNC(sbc3_state::hexdisp_r)),
+				write32s_delegate(*this, FUNC(sbc3_state::hexdisp_w)));
+		m_hexdisp_mapped = true;
+	}
+	hexdisp_update();
 
 	// DUART inputs IP0-IP5 are jumpers: pulled up, and grounded when the
 	// jumper is fitted.  The monitor reads them at reset (IP2 fitted
@@ -419,6 +491,9 @@ static INPUT_PORTS_START( sbc3 )
 	PORT_CONFNAME(0x02, 0x02, "Expansion RAM at $02000000")
 	PORT_CONFSETTING(   0x00, DEF_STR( None ))
 	PORT_CONFSETTING(   0x02, "32 MB")
+	PORT_CONFNAME(0x04, 0x04, "Hex Display board at $AB0000")
+	PORT_CONFSETTING(   0x00, "Not fitted")
+	PORT_CONFSETTING(   0x04, "Fitted")
 
 	// Jumpers on DUART IP0-IP5: fitted = input grounded.  Changes take
 	// effect at the next reset.
@@ -483,6 +558,8 @@ void sbc3_state::sbc3(machine_config &config)
 
 	ATA_INTERFACE(config, m_ata).options(ata_devices, "cf", nullptr, true);
 	m_ata->irq_handler().set(FUNC(sbc3_state::cf_irq_w));
+
+	config.set_default_layout(layout_sbc3);
 
 	QUICKLOAD(config, "quickload", "elf,bin,netbsd", attotime::from_msec(500)).set_load_callback(FUNC(sbc3_state::quickload_cb));
 }
