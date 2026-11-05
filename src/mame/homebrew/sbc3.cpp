@@ -17,7 +17,9 @@
           byte; CF D0-D7 on CPU D31-D24)
           INTRQ: optionally on IPL 4, auto-vectored (configuration switch)
       MC68230 PI/T at $AF0001 (odd bytes), timer clocked at 10 MHz
-          IPL 1, vectored through TIACK/TIVR
+          IPL 1, vectored through TIACK/TIVR.  IRQ1 is the PC3/TOUT pin:
+          with TCR bits 7-5 = 00x it's a plain port C pin again, and
+          asserts IRQ1 if PCDDR/PCDR drive it low (see pit_irq_update)
       DS1307 RTC on I2C, bit-banged on PI/T port C: PC0 = SDA, PC1 = SCL,
           open-drain (PCDR held at 0; a line is pulled low by setting its
           PCDDR bit)
@@ -29,7 +31,8 @@
           here they return $FF and don't bus-error.
 
     Interrupt acknowledge, as decoded by the board:
-      level 1  PI/T timer vector (TIVR)
+      level 1  PI/T timer vector (TIVR) when PC7 is TIACK (TCR 10x);
+               otherwise nothing answers: a spurious interrupt
       level 2  DUART vector (IVR)
       others   auto-vectored
 
@@ -97,6 +100,9 @@ private:
 	void cf_irq_w(int state);
 	void i2c_update();
 	u8 pit_pc_r();
+	void pit_tirq_w(int state);
+	void pit_irq_update();
+	u8 pit_iack_r();
 	u32 berr_r(offs_t offset, u32 mem_mask);
 	void berr_w(offs_t offset, u32 data, u32 mem_mask);
 	u32 hexdisp_r(offs_t offset, u32 mem_mask);
@@ -128,6 +134,11 @@ private:
 	u32 m_hexdisp = 0;          // latched value, digit 1 in bits 31-28
 	u8 m_hexdisp_valid = 0;     // which bytes have been written since power-on
 	u8 m_pcddr = 0;
+	u8 m_pcdr = 0;              // PI/T port C data latch (as written)
+	u8 m_tcr = 0;               // PI/T timer control register
+	int m_pit_tirq = 0;         // the PI/T's internal timer interrupt request
+	memory_passthrough_handler m_pcdr_tap;
+	memory_passthrough_handler m_tcr_tap;
 	int m_rtc_sda = 1;
 	int m_cf_irq = 0;
 };
@@ -171,7 +182,7 @@ void sbc3_state::mem_map(address_map &map)
  */
 void sbc3_state::cpu_space_map(address_map &map)
 {
-	map(0xfffffff3, 0xfffffff3).lr8(NAME([this] () -> u8 { return m_pit->irq_tiack(); }));
+	map(0xfffffff3, 0xfffffff3).r(FUNC(sbc3_state::pit_iack_r));
 	map(0xfffffff5, 0xfffffff5).lr8(NAME([this] () -> u8 { return m_duart->get_irq_vector(); }));
 	map(0xfffffff7, 0xfffffff7).lr8(NAME([] () -> u8 { return m68000_base_device::autovector(3); }));
 	map(0xfffffff9, 0xfffffff9).lr8(NAME([] () -> u8 { return m68000_base_device::autovector(4); }));
@@ -253,6 +264,59 @@ void sbc3_state::i2c_update()
 {
 	m_rtc->scl_write(BIT(m_pcddr, 1) ? 0 : 1);
 	m_rtc->sda_write(BIT(m_pcddr, 0) ? 0 : 1);
+}
+
+/*
+ * IRQ1 comes from the PI/T's PC3/TOUT pin (active low), and level 1
+ * interrupt acknowledges go to PC7/TIACK.  What those pins do depends
+ * on TCR bits 7-5:
+ *   00x  PC3 and PC7 are port C pins: PC3 is whatever PCDDR/PCDR make it
+ *        (an output driven low asserts IRQ1; an input floats high)
+ *   01x  PC3 is a square-wave TOUT (not modelled: treated as inactive)
+ *   100  TOUT = interrupt request, negated; PC7 = TIACK
+ *   101  TOUT = interrupt request, enabled; PC7 = TIACK (vectored)
+ *   110  TOUT = interrupt request, negated; PC7 = port pin
+ *   111  TOUT = interrupt request, enabled; PC7 = port pin (autovectored)
+ * MAME's PI/T model only reports its internal timer request, so the
+ * pin logic is done here from shadow copies of TCR, PCDDR and PCDR.
+ */
+void sbc3_state::pit_irq_update()
+{
+	bool irq;
+	switch (m_tcr & 0xe0)
+	{
+	case 0x00:
+	case 0x20:
+		irq = BIT(m_pcddr, 3) && !BIT(m_pcdr, 3);
+		break;
+	case 0xa0:
+	case 0xe0:
+		irq = m_pit_tirq;
+		break;
+	default:
+		irq = false;
+		break;
+	}
+	m_maincpu->set_input_line(M68K_IRQ_1, irq ? ASSERT_LINE : CLEAR_LINE);
+}
+
+void sbc3_state::pit_tirq_w(int state)
+{
+	m_pit_tirq = state;
+	pit_irq_update();
+}
+
+/*
+ * The board routes the level 1 acknowledge to PC7/TIACK.  The PI/T only
+ * answers it in TIACK mode with its interrupt enabled; otherwise nothing
+ * drives DSACK, the cycle ends in a bus error, and the CPU takes the
+ * spurious interrupt exception (vector 24).
+ */
+u8 sbc3_state::pit_iack_r()
+{
+	if ((m_tcr & 0xe0) == 0xa0)
+		return m_pit->irq_tiack();
+	return m68000_base_device::autovector(0);  // spurious interrupt
 }
 
 u8 sbc3_state::pit_pc_r()
@@ -408,14 +472,46 @@ void sbc3_state::machine_start()
 				{
 					m_pcddr = u8(data >> 16);
 					i2c_update();
+					pit_irq_update();
 				}
 			},
 			&m_pcddr_tap);
+
+	// PCDR (register $0C: $AF0019) and TCR (register $10: $AF0021), for
+	// the PC3/TOUT pin logic.  Taps run before the PI/T sees the write,
+	// which doesn't matter: only the shadows are used.
+	m_pcdr_tap = space.install_write_tap(
+			0xaf0018, 0xaf001b,
+			"pcdr_w",
+			[this] (offs_t offset, u32 &data, u32 mem_mask)
+			{
+				if (ACCESSING_BITS_16_23)
+				{
+					m_pcdr = u8(data >> 16);
+					pit_irq_update();
+				}
+			},
+			&m_pcdr_tap);
+	m_tcr_tap = space.install_write_tap(
+			0xaf0020, 0xaf0023,
+			"tcr_w",
+			[this] (offs_t offset, u32 &data, u32 mem_mask)
+			{
+				if (ACCESSING_BITS_16_23)
+				{
+					m_tcr = u8(data >> 16);
+					pit_irq_update();
+				}
+			},
+			&m_tcr_tap);
 
 	save_item(NAME(m_cf_irq));
 	save_item(NAME(m_hexdisp));
 	save_item(NAME(m_hexdisp_valid));
 	save_item(NAME(m_pcddr));
+	save_item(NAME(m_pcdr));
+	save_item(NAME(m_tcr));
+	save_item(NAME(m_pit_tirq));
 	save_item(NAME(m_rtc_sda));
 }
 
@@ -464,9 +560,13 @@ void sbc3_state::machine_reset()
 	m_duart->ip5_w(BIT(links, 5) ? 0 : 1);
 	m_duart->ip6_w(1);
 
-	// The PI/T resets port C to inputs: both I2C lines float high.
+	// The PI/T resets port C to inputs (both I2C lines float high) and
+	// TCR to 0, so PC3 floats high and IRQ1 is inactive.
 	m_pcddr = 0;
+	m_pcdr = 0;
+	m_tcr = 0;
 	i2c_update();
+	pit_irq_update();
 
 	m_overlay_tap.remove();
 	m_overlay_tap = space.install_read_tap(
@@ -550,7 +650,7 @@ void sbc3_state::sbc3(machine_config &config)
 	rs232b.rxd_handler().set(m_duart, FUNC(xr68c681_device::rx_b_w));
 
 	PIT68230(config, m_pit, 10_MHz_XTAL);
-	m_pit->timer_irq_callback().set_inputline(m_maincpu, M68K_IRQ_1);
+	m_pit->timer_irq_callback().set(FUNC(sbc3_state::pit_tirq_w));
 	m_pit->pc_in_callback().set(FUNC(sbc3_state::pit_pc_r));
 
 	I2C_DS1307(config, m_rtc);
