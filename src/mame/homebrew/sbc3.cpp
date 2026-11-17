@@ -8,8 +8,12 @@
       MC68030 @ 40 MHz (no FPU)
       8 MB RAM at $000000 (after reset, the first 8 bytes read the ROM's
           reset vectors until the first access to the ROM)
-      Optional 32 MB expansion RAM at $02000000 (configuration switch;
-          A24-A31 decoded for it, otherwise the board repeats every 16 MB)
+      RAM bank 1: 8 MB at $10000000 (configuration switch: fitted or
+          empty sockets).  As decoded by the glue CPLD with 2Mx8 SRAMs
+          (sbc3_glue.v, RAM_MB = 8): A31-A24 are ignored, so the board
+          repeats every 16 MB, except that $10000000-$107FFFFF is bank 1
+          and $10800000-$10FFFFFF gives a bus error.  Empty sockets still
+          get a DSACK: reads float high and writes are lost
       ROM (up to 4 MB) at $C00000
       XR68C681 DUART @ 7.3728 MHz at $AD0001 (odd bytes, every 2nd byte)
           IPL 2, vectored through its IVR
@@ -103,6 +107,7 @@ private:
 	void pit_tirq_w(int state);
 	void pit_irq_update();
 	u8 pit_iack_r();
+	void bus_error(u32 address, bool read);
 	u32 berr_r(offs_t offset, u32 mem_mask);
 	void berr_w(offs_t offset, u32 data, u32 mem_mask);
 	u32 hexdisp_r(offs_t offset, u32 mem_mask);
@@ -125,8 +130,8 @@ private:
 
 	memory_passthrough_handler m_overlay_tap;
 	memory_passthrough_handler m_pcddr_tap;
-	static constexpr u32 EXP_RAM_BASE = 0x02000000;
-	static constexpr u32 EXP_RAM_SIZE = 0x02000000;     // 32 MB
+	static constexpr u32 EXP_RAM_BASE = 0x10000000;     // RAM bank 1
+	static constexpr u32 EXP_RAM_SIZE = 0x00800000;     // 8 MB
 	std::unique_ptr<u8[]> m_exp_ram;
 	bool m_exp_mapped = false;
 	static constexpr u32 HEXDISP_BASE = 0x00ab0000;
@@ -150,10 +155,10 @@ private:
 
 void sbc3_state::mem_map(address_map &map)
 {
-	// The on-board decode uses only A0-A23, so the board repeats every
-	// 16 MB (the mirrors below).  The optional expansion RAM at
-	// $02000000-$03FFFFFF decodes the upper address bits and replaces
-	// those copies; it's installed in machine_reset().
+	// The on-board decode ignores A24-A31, so the board repeats every
+	// 16 MB (the mirrors below), except for $10xxxxxx: RAM bank 1 at
+	// $10000000-$107FFFFF and a bus error above it.  Those are installed
+	// in machine_start() and machine_reset(), over the mirrors.
 	map.unmap_value_high();
 
 	// RAM is installed in machine_start() (its size is configurable),
@@ -192,23 +197,24 @@ void sbc3_state::cpu_space_map(address_map &map)
 }
 
 
-u32 sbc3_state::berr_r(offs_t offset, u32 mem_mask)
+void sbc3_state::bus_error(u32 address, bool read)
 {
 	if (!machine().side_effects_disabled())
 	{
-		m_maincpu->set_buserror_details(0x800000 + offset * 4, 1, m_maincpu->get_fc());
+		m_maincpu->set_buserror_details(address, read ? 1 : 0, m_maincpu->get_fc());
 		m_maincpu->pulse_input_line(M68K_LINE_BUSERROR, attotime::zero);
 	}
+}
+
+u32 sbc3_state::berr_r(offs_t offset, u32 mem_mask)
+{
+	bus_error(0x800000 + offset * 4, true);
 	return 0xffffffff;
 }
 
 void sbc3_state::berr_w(offs_t offset, u32 data, u32 mem_mask)
 {
-	if (!machine().side_effects_disabled())
-	{
-		m_maincpu->set_buserror_details(0x800000 + offset * 4, 0, m_maincpu->get_fc());
-		m_maincpu->pulse_input_line(M68K_LINE_BUSERROR, attotime::zero);
-	}
+	bus_error(0x800000 + offset * 4, false);
 }
 
 
@@ -453,9 +459,18 @@ void sbc3_state::machine_start()
 		m_rom[2] = 0x60fe4e71;      // bra.s * ; nop
 	}
 
-	// RAM from $0, at most 8 MB.
+	// RAM bank 0 from $0, at most 8 MB.
 	const u32 ramsize = std::min<u32>(m_ram->size(), 0x800000);
 	space.install_ram(0x000000, ramsize - 1, 0xff000000, m_ram->pointer());
+
+	// $10xxxxxx isn't a copy of the board.  Bank 1 sockets, empty until
+	// machine_reset() puts the RAM in (the CPLD still answers, so reads
+	// float high and writes go nowhere), then a bus error to $10FFFFFF.
+	space.nop_readwrite(EXP_RAM_BASE, EXP_RAM_BASE + EXP_RAM_SIZE - 1);
+	space.install_read_handler(0x10800000, 0x10ffffff,
+			read32sm_delegate(*this, NAME([this] (offs_t offset) -> u32 { bus_error(0x10800000 + offset * 4, true); return 0xffffffff; })));
+	space.install_write_handler(0x10800000, 0x10ffffff,
+			write32sm_delegate(*this, NAME([this] (offs_t offset, u32 data) { bus_error(0x10800000 + offset * 4, false); })));
 
 	// Expansion RAM, mapped at the first reset if enabled.
 	m_exp_ram = std::make_unique<u8[]>(EXP_RAM_SIZE);
@@ -527,7 +542,7 @@ void sbc3_state::machine_reset()
 
 	space.install_rom(0x000000, 0x000007, &m_rom[0]);
 
-	// Expansion RAM (configuration switch; turning it off again needs a
+	// RAM bank 1 (configuration switch; turning it off again needs a
 	// restart of MAME).
 	if (BIT(m_config->read(), 1) && !m_exp_mapped)
 	{
@@ -537,10 +552,11 @@ void sbc3_state::machine_reset()
 
 	// Hex Display board: decodes A16-A23 and A0-A1 only, so its four
 	// bytes repeat through the 64K page (and every 16 MB, like the rest
-	// of the board).  Not fitted: the page keeps its bus error.
+	// of the board, but not at $10xxxxxx, where the CPLD gives a bus
+	// error).  Not fitted: the page keeps its bus error.
 	if (BIT(m_config->read(), 2) && !m_hexdisp_mapped)
 	{
-		space.install_readwrite_handler(HEXDISP_BASE, HEXDISP_BASE + 3, 0, 0xff00fffc, 0,
+		space.install_readwrite_handler(HEXDISP_BASE, HEXDISP_BASE + 3, 0, 0xef00fffc, 0,
 				read32s_delegate(*this, FUNC(sbc3_state::hexdisp_r)),
 				write32s_delegate(*this, FUNC(sbc3_state::hexdisp_w)));
 		m_hexdisp_mapped = true;
@@ -588,9 +604,9 @@ static INPUT_PORTS_START( sbc3 )
 	PORT_CONFNAME(0x01, 0x00, "CF INTRQ wired to IPL 4")
 	PORT_CONFSETTING(   0x00, DEF_STR( No ))
 	PORT_CONFSETTING(   0x01, DEF_STR( Yes ))
-	PORT_CONFNAME(0x02, 0x02, "Expansion RAM at $02000000")
-	PORT_CONFSETTING(   0x00, DEF_STR( None ))
-	PORT_CONFSETTING(   0x02, "32 MB")
+	PORT_CONFNAME(0x02, 0x02, "RAM bank 1 at $10000000")
+	PORT_CONFSETTING(   0x00, "Empty")
+	PORT_CONFSETTING(   0x02, "8 MB")
 	PORT_CONFNAME(0x04, 0x04, "Hex Display board at $AB0000")
 	PORT_CONFSETTING(   0x00, "Not fitted")
 	PORT_CONFSETTING(   0x04, "Fitted")
