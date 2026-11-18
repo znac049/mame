@@ -18,7 +18,9 @@
       XR68C681 DUART @ 7.3728 MHz at $AD0001 (odd bytes, every 2nd byte)
           IPL 2, vectored through its IVR
       CompactFlash, 16-bit True IDE, at $AE0000 (registers every 2nd
-          byte; CF D0-D7 on CPU D31-D24)
+          byte; CF D0-D7 on CPU D31-D24).  Optionally (configuration
+          switch) A4 selects /CS1: alternate status / device control at
+          $AE001C
           INTRQ: optionally on IPL 4, auto-vectored (configuration switch)
       MC68230 PI/T at $AF0001 (odd bytes), timer clocked at 10 MHz
           IPL 1, vectored through TIACK/TIVR.  IRQ1 is the PC3/TOUT pin:
@@ -99,6 +101,8 @@ private:
 	void mem_map(address_map &map) ATTR_COLD;
 	void cpu_space_map(address_map &map) ATTR_COLD;
 
+	u16 cf_reg_r(offs_t reg);
+	void cf_reg_w(offs_t reg, u16 data);
 	u32 cf_r(offs_t offset, u32 mem_mask);
 	void cf_w(offs_t offset, u32 data, u32 mem_mask);
 	void cf_irq_w(int state);
@@ -172,8 +176,9 @@ void sbc3_state::mem_map(address_map &map)
 	// DUART: registers on the odd byte lane, every 2nd byte.
 	map(0xad0000, 0xad001f).mirror(0xff000000).rw(m_duart, FUNC(xr68c681_device::read), FUNC(xr68c681_device::write)).umask32(0x00ff00ff);
 
-	// CompactFlash: 16-bit registers every 2nd byte.
-	map(0xae0000, 0xae000f).mirror(0xff000000).rw(FUNC(sbc3_state::cf_r), FUNC(sbc3_state::cf_w));
+	// CompactFlash: 16-bit registers every 2nd byte; A4 selects the
+	// command block (/CS0) or the control block (/CS1).
+	map(0xae0000, 0xae001f).mirror(0xff000000).rw(FUNC(sbc3_state::cf_r), FUNC(sbc3_state::cf_w));
 
 	// PI/T: registers on the odd byte lane, every 2nd byte.
 	map(0xaf0000, 0xaf003f).mirror(0xff000000).rw(m_pit, FUNC(pit68230_device::read), FUNC(pit68230_device::write)).umask32(0x00ff00ff);
@@ -341,25 +346,60 @@ u8 sbc3_state::pit_pc_r()
     bus: task-file registers appear in the high byte, and data words
     land in memory in disk byte order.  Register n is at $AE0000 + 2n,
     i.e. the upper or lower half of a 32-bit word.
+
+    Optionally (configuration switch, default off) A4 picks the register
+    block; with it off, $AE0010-$AE001F gives a bus error, as on an
+    unmodified board.  A4 = 0 drives /CS0, the command block
+    ($AE0000-$AE000E, data to status/command); A4 = 1 drives /CS1, the
+    control block, whose register 6 is the alternate status (read) and
+    device control (write, with nIEN and SRST) at $AE001C.  Register 7
+    of the control block, the drive address, is at $AE001E.
 ***************************************************************************/
+
+u16 sbc3_state::cf_reg_r(offs_t reg)
+{
+	return BIT(reg, 3) ? m_ata->cs1_r(reg & 7) : m_ata->cs0_r(reg & 7);
+}
+
+void sbc3_state::cf_reg_w(offs_t reg, u16 data)
+{
+	if (BIT(reg, 3))
+		m_ata->cs1_w(reg & 7, data);
+	else
+		m_ata->cs0_w(reg & 7, data);
+}
 
 u32 sbc3_state::cf_r(offs_t offset, u32 mem_mask)
 {
 	u32 data = 0;
 
+	// Control block not wired (configuration switch): bus error, as for
+	// any other undecoded address.
+	if (BIT(offset, 2) && !BIT(m_config->read(), 6))
+	{
+		bus_error(0xae0000 + offset * 4, true);
+		return 0xffffffff;
+	}
+
 	if (ACCESSING_BITS_16_31)
-		data |= u32(swapendian_int16(m_ata->cs0_r(offset * 2))) << 16;
+		data |= u32(swapendian_int16(cf_reg_r(offset * 2))) << 16;
 	if (ACCESSING_BITS_0_15)
-		data |= swapendian_int16(m_ata->cs0_r(offset * 2 + 1));
+		data |= swapendian_int16(cf_reg_r(offset * 2 + 1));
 	return data;
 }
 
 void sbc3_state::cf_w(offs_t offset, u32 data, u32 mem_mask)
 {
+	if (BIT(offset, 2) && !BIT(m_config->read(), 6))
+	{
+		bus_error(0xae0000 + offset * 4, false);
+		return;
+	}
+
 	if (ACCESSING_BITS_16_31)
-		m_ata->cs0_w(offset * 2, swapendian_int16(u16(data >> 16)));
+		cf_reg_w(offset * 2, swapendian_int16(u16(data >> 16)));
 	if (ACCESSING_BITS_0_15)
-		m_ata->cs0_w(offset * 2 + 1, swapendian_int16(u16(data)));
+		cf_reg_w(offset * 2 + 1, swapendian_int16(u16(data)));
 }
 
 void sbc3_state::cf_irq_w(int state)
@@ -615,6 +655,9 @@ static INPUT_PORTS_START( sbc3 )
 	PORT_CONFNAME(0x04, 0x04, "Hex Display board at $AB0000")
 	PORT_CONFSETTING(   0x00, "Not fitted")
 	PORT_CONFSETTING(   0x04, "Fitted")
+	PORT_CONFNAME(0x40, 0x00, "CF /CS1 on A4 (alternate status at $AE001C)")
+	PORT_CONFSETTING(   0x00, DEF_STR( No ))
+	PORT_CONFSETTING(   0x40, DEF_STR( Yes ))
 	PORT_CONFNAME(0x30, 0x00, "CPU clock")
 	PORT_CONFSETTING(   0x10, "25 MHz")
 	PORT_CONFSETTING(   0x20, "33 MHz")
