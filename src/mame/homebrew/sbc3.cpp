@@ -5,7 +5,7 @@
     SBC3 -- homebrew 68030 single-board computer
 
     Hardware:
-      MC68030 @ 40 MHz (no FPU)
+      MC68030 @ 40 MHz (no FPU); 25, 33 or 50 MHz by configuration switch
       8 MB RAM at $000000 (after reset, the first 8 bytes read the ROM's
           reset vectors until the first access to the ROM)
       RAM bank 1: 8 MB at $10000000 (configuration switch: fitted or
@@ -542,6 +542,11 @@ void sbc3_state::machine_reset()
 
 	space.install_rom(0x000000, 0x000007, &m_rom[0]);
 
+	// CPU clock (configuration switch, applied at reset)
+	static constexpr u32 cpu_clocks[4] = { 40'000'000, 25'000'000, 33'333'333, 50'000'000 };
+	m_maincpu->set_unscaled_clock(cpu_clocks[(m_config->read() >> 4) & 3]);
+	logerror("CPU clock %u Hz\n", m_maincpu->unscaled_clock());
+
 	// RAM bank 1 (configuration switch; turning it off again needs a
 	// restart of MAME).
 	if (BIT(m_config->read(), 1) && !m_exp_mapped)
@@ -610,6 +615,11 @@ static INPUT_PORTS_START( sbc3 )
 	PORT_CONFNAME(0x04, 0x04, "Hex Display board at $AB0000")
 	PORT_CONFSETTING(   0x00, "Not fitted")
 	PORT_CONFSETTING(   0x04, "Fitted")
+	PORT_CONFNAME(0x30, 0x00, "CPU clock")
+	PORT_CONFSETTING(   0x10, "25 MHz")
+	PORT_CONFSETTING(   0x20, "33 MHz")
+	PORT_CONFSETTING(   0x00, "40 MHz")
+	PORT_CONFSETTING(   0x30, "50 MHz")
 
 	// Jumpers on DUART IP0-IP5: fitted = input grounded.  Changes take
 	// effect at the next reset.
